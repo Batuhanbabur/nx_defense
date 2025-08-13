@@ -1,0 +1,581 @@
+// NX Defense — ITAR QuickCheck (Canvas-ready, single file)
+// Paste into your Canvas textdoc and Run Code. Tailwind classes are optional but included.
+// If you have a logo, place it at /public/nx-logo.png or change LOGO_SRC below.
+
+import React, { useEffect, useMemo, useState } from "react";
+
+/* =====================
+   Constants & Branding
+   ===================== */
+const APP_TITLE = "NX Defense — ITAR QuickCheck";
+const LOGO_SRC = "/Users/batuhanbabur/Desktop/NX_logo.png"; // put your logo here (optional)
+
+/* =====================
+   Utilities & Hooks
+   ===================== */
+function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
+  const [state, setState] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? (JSON.parse(raw) as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(state));
+    } catch {
+      // no-op
+    }
+  }, [key, state]);
+  return [state, setState];
+}
+
+// Shallow TR→EN normalize to catch common PPE/armor terms
+const TR_MAP: Array<[RegExp, string]> = [
+  [/balistik/giu, "ballistic"],
+  [/zırh|zirh/giu, "armor"],
+  [/kask/giu, "helmet"],
+  [/lazer/giu, "laser"],
+  [/gizleme|iz\s*azalt/giu, "stealth"],
+  [/dirsek\s*ped/giu, "elbow pad"],
+];
+function normalize(text: string): string {
+  let t = (text || "").toString();
+  for (const [re, en] of TR_MAP) t = t.replace(re, en);
+  return t;
+}
+
+/* =====================
+   PSC dictionary (seed) + Import/Export
+   Import JSON converted from PSC Manual: { "0001": { title, includes[], excludes[] }, ... }
+   ===================== */
+type PSCDef = { title: string; includes?: string[]; excludes?: string[] };
+type PSCDict = Record<string, PSCDef>;
+
+const PSC_SEED: PSCDict = {
+  "8465": {
+    title: "Individual Equipment",
+    includes: [
+      "Musette Bags",
+      "Duffel Bags",
+      "Ammunition Belts",
+      "Pistol Belts",
+      "Sleeping Bags",
+      "Knapsacks",
+      "Knee/Elbow Pads",
+      "Sunglasses",
+    ],
+    excludes: ["Toilet Articles", "Mess Gear", "Fabric Utility Containers"],
+  },
+  "8470": {
+    title: "Armor, Personal",
+    includes: ["Clothing specially designed for use as personal armor"],
+    excludes: [
+      "Specialized flight clothing/accessories where ballistic property is secondary",
+      "Special purpose clothing where primary function is not ballistic protection",
+    ],
+  },
+  "8475": {
+    title: "Specialized Flight Clothing and Accessories",
+    includes: [
+      "Antiexposure",
+      "Antigravity",
+      "Partial/Full Pressure ensembles",
+      "Unpressurized protective helmets",
+      "Eye protection",
+      "Sound attenuation",
+    ],
+    excludes: [
+      "Conventional flight clothing (winter/summer/intermediate)",
+      "Components designed for both specialized and conventional ensembles",
+    ],
+  },
+  "8415": {
+    title: "Clothing, Special Purpose",
+    includes: [
+      "Special purpose headwear (incl. helmets, except ballistic)",
+      "Safety & protective clothing",
+      "Athletic clothing",
+      "Safety/combat/protective/work gloves",
+      "Submarine deck exposure clothing",
+      "Flight clothing components for both specialized and conventional ensembles",
+    ],
+    excludes: [
+      "Sporting/athletic gloves",
+      "Athletic footwear",
+      "Safety footwear",
+      "Personal armor",
+      "Special hospital/surgical clothing",
+      "Items whose primary purpose is ballistic resistance",
+    ],
+  },
+};
+
+// PSC→USML heuristic hints (not determinations)
+type Hint = { sig: "strong" | "weak" | "medium"; usml: string; why: string };
+const PSC_HINTS: Record<string, Hint[]> = {
+  "8470": [
+    {
+      sig: "strong",
+      usml: "Cat X(a)(1)",
+      why: "Personal armor; if ≥ NIJ Type IV, Cat X explicit",
+    },
+  ],
+  "8465": [
+    {
+      sig: "weak",
+      usml: "Cat X(a)(7)",
+      why: "Only if advanced eye protection (laser visor) with OD>3; many 8465 are non-ITAR",
+    },
+  ],
+  "8475": [
+    {
+      sig: "weak",
+      usml: "Check Cat X(a)(5)/(a)(7)",
+      why: "Only if integrated weapon-cueing or laser optics; otherwise not Cat X",
+    },
+  ],
+  "8415": [
+    {
+      sig: "weak",
+      usml: "Cat X(a)(2)",
+      why: ">900nm signature reduction garments could be Cat X; otherwise EAR/CCL",
+    },
+  ],
+};
+
+/* =====================
+   USML keyword rules (expandable)
+   ===================== */
+type Rule = {
+  id: string;
+  title: string;
+  pos: RegExp[];
+  neg?: RegExp[];
+};
+const USML_RULES: Rule[] = [
+  { id: "Cat I", title: "Firearms & related", pos: [/silencer|suppressor/i, /machine\s*gun|fully\s*automatic/i], neg: [] },
+  { id: "Cat II", title: "Artillery & launchers", pos: [/howitzer|artillery|cannon/i, /mortar/i, /grenade\s*launcher/i], neg: [] },
+  { id: "Cat III", title: "Ammunition", pos: [/tracer|incendiary|explosive\s*projectile/i], neg: [/blank|dummy\s*ammo/i] },
+  { id: "Cat IV", title: "Missiles/Rockets/Bombs", pos: [/missile|rocket|torpedo|warhead|naval\s*mine/i, /MANPADS|man-?portable\s*air/i], neg: [/model\s*rocket|hobby\s*rocket/i] },
+  { id: "Cat X", title: "PPE & armor", pos: [/body\s*armor|ballistic\s*(vest|plate|insert)/i, /NIJ\s*(Type\s*)?IV|ESAPI|ESBI/i, /laser\s*protect(ion|ive)|OD\s*>?\s*3/i, /infrared\s*stealth|signature\s*reduction|radar\s*absorb/i], neg: [/airsoft|training\s*replica/i] },
+  { id: "Cat XI", title: "Military electronics", pos: [/military\s*radar|SAR\b|ISAR\b|DRFM|jamming|EW\b/i], neg: [/ICAO|FAA|civil/i] },
+];
+
+function scanUSML(text: string): { hits: Rule[]; negs: Rule[]; details: string[] } {
+  const hits: Rule[] = [];
+  const negs: Rule[] = [];
+  const details: string[] = [];
+  for (const r of USML_RULES) {
+    if (r.pos.some((re) => re.test(text))) {
+      hits.push(r);
+      details.push(`USML hit → ${r.id} – ${r.title}`);
+    }
+    if (r.neg && r.neg.some((re) => re.test(text))) {
+      negs.push(r);
+      details.push(`USML negative → ${r.id}`);
+    }
+  }
+  return { hits, negs, details };
+}
+
+/* =====================
+   Clarifier flags + one-sentence explanations (as requested)
+   ===================== */
+type Flags = { ballistic: boolean; nij: boolean; laserIR: boolean; stealth: boolean; dodFunded: boolean };
+
+const DEFAULT_FLAGS: Flags = { ballistic: false, nij: false, laserIR: false, stealth: false, dodFunded: false };
+
+const FLAG_META: Array<{ key: keyof Flags; label: string; help: string }> = [
+  {
+    key: "ballistic",
+    label: "Ballistic protection",
+    help: "Indicates the product is designed to stop bullets or shrapnel (not just impact cushioning).",
+  },
+  {
+    key: "nij",
+    label: "NIJ level specified",
+    help: "Confirms a tested National Institute of Justice armor rating (e.g., IIIA/III/IV).",
+  },
+  {
+    key: "laserIR",
+    label: "Laser/IR protective",
+    help: "Provides protection against laser hazards or reduces exposure in the infrared spectrum.",
+  },
+  {
+    key: "stealth",
+    label: "Signature reduction (radar/IR/visual)",
+    help: "Purpose-built to reduce detectability (e.g., IR suppression, radar-absorbent, visual camouflage beyond commercial fashion).",
+  },
+  {
+    key: "dodFunded",
+    label: "DoD-funded or to a military spec",
+    help: "Developed under a U.S. DoD contract or built to a specific military specification (MIL-STD).",
+  },
+];
+
+/* =====================
+   Decision Engine (pure)
+   ===================== */
+type EvalOutput = {
+  decision: "Evet (ITAR kapsamında)" | "Hayır (ITAR kapsamında değil)" | "Ek araştırma gerekli";
+  explanation: string[];
+  hits: Rule[];
+  negs: Rule[];
+  psc?: string;
+};
+
+function evaluate({
+  text,
+  pscCode,
+  flags,
+  pscDict,
+}: {
+  text: string;
+  pscCode?: string;
+  flags: Flags;
+  pscDict: PSCDict;
+}): EvalOutput {
+  const q = normalize(text || "");
+  const psc = (pscCode || "").replace(/\D/g, "");
+  const { hits, negs, details } = scanUSML(q);
+
+  const hints: Hint[] = (psc && pscDict && pscDict[psc] && PSC_HINTS[psc]) ? PSC_HINTS[psc] : [];
+  const strong = hints.find((h) => h.sig === "strong");
+
+  const boosters: string[] = [];
+  if (flags.ballistic) boosters.push("ballistic");
+  if (flags.nij) boosters.push("NIJ");
+  if (flags.laserIR) boosters.push("laser/IR");
+  if (flags.stealth) boosters.push("signature reduction");
+  if (flags.dodFunded) boosters.push("DoD-funded");
+
+  const explanation: string[] = [];
+  explanation.push(...details);
+  if (psc) explanation.push(`PSC context → ${psc} (${(pscDict && pscDict[psc] && pscDict[psc].title) || "Unknown"})`);
+  if (hints.length) explanation.push(...hints.map((h) => `PSC hint → ${h.usml}: ${h.why}`));
+  if (boosters.length) explanation.push(`Clarifiers → ${boosters.join(", ")}`);
+
+  const positive = hits.length > 0 || Boolean(strong) || boosters.length >= 2;
+  const negative = negs.length > 0;
+
+  let decision: EvalOutput["decision"] = "Ek araştırma gerekli";
+  if (positive && !negative) decision = "Evet (ITAR kapsamında)";
+  else if (!positive && psc && (!hints || !hints.length)) decision = "Hayır (ITAR kapsamında değil)";
+
+  return { decision, explanation, hits, negs, psc };
+}
+
+/* =====================
+   Built-in Tests (lightweight)
+   ===================== */
+type TestResult = { name: string; expect: string; got: string; pass: boolean };
+function runBuiltinTests(): TestResult[] {
+  const dict = PSC_SEED; // isolate from user-imported changes
+  const cases = [
+    {
+      name: "Non-ballistic elbow pad (PSC 8465) → Hayır",
+      input: { text: "Long-coverage elbow pad for harsh use, comfortable and durable.", pscCode: "8465", flags: DEFAULT_FLAGS },
+      expectPrefix: "Hayır",
+    },
+    {
+      name: "Ballistic elbow pad NIJ IV (PSC 8470) → Evet",
+      input: { text: "Ballistic elbow pad NIJ IV hard armor plate", pscCode: "8470", flags: { ...DEFAULT_FLAGS, ballistic: true, nij: true } },
+      expectPrefix: "Evet",
+    },
+    {
+      name: "Laser protective visor OD 4 (PSC 8465) → Evet",
+      input: { text: "Laser protective visor with optical density OD 4", pscCode: "8465", flags: { ...DEFAULT_FLAGS, laserIR: true } },
+      expectPrefix: "Evet",
+    },
+    {
+      name: "Model rocket (no PSC) → Hayır",
+      input: { text: "model rocket kit for hobby use", pscCode: "", flags: DEFAULT_FLAGS },
+      expectPrefix: "Hayır",
+    },
+    {
+      name: "Generic description (no signals) → Ek araştırma",
+      input: { text: "Protective gear for outdoor use", pscCode: "", flags: DEFAULT_FLAGS },
+      expectPrefix: "Ek araştırma",
+    },
+    {
+      name: "DoD-funded only (no keywords) → Evet",
+      input: { text: "Prototype protective garment developed under DoD contract.", pscCode: "8415", flags: { ...DEFAULT_FLAGS, dodFunded: true } },
+      expectPrefix: "Evet",
+    },
+  ];
+  const results: TestResult[] = [];
+  for (const tc of cases) {
+    const r = evaluate({ ...tc.input, pscDict: dict });
+    const pass = r.decision.startsWith(tc.expectPrefix);
+    results.push({ name: tc.name, got: r.decision, expect: tc.expectPrefix, pass });
+  }
+  return results;
+}
+
+/* =====================
+   UI Components (inline)
+   ===================== */
+function NXHeader(): JSX.Element {
+  return (
+    <header className="w-full bg-black text-white">
+      <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
+        <img src={LOGO_SRC} alt="NX Defense logo" className="h-8 w-8 object-contain" loading="eager" />
+        <div className="flex flex-col">
+          <h1 className="text-lg font-semibold tracking-wide">{APP_TITLE}</h1>
+          <p className="text-xs text-neutral-300">USML × PSC crosswalk with guided clarifiers</p>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* =====================
+   Main Component
+   ===================== */
+export default function App(): JSX.Element {
+  useEffect(() => {
+    if (typeof document !== "undefined") {
+      document.title = APP_TITLE;
+    }
+  }, []);
+
+  const [desc, setDesc] = useState<string>("");
+  const [psc, setPsc] = useState<string>("");
+  const [flags, setFlags] = useState<Flags>({ ...DEFAULT_FLAGS });
+
+  const [pscDict, setPscDict] = useLocalStorage<PSCDict>("pscDictionaryFull", PSC_SEED);
+  const [showImport, setShowImport] = useState<boolean>(false);
+  const [importText, setImportText] = useState<string>("");
+
+  const res = useMemo(() => evaluate({ text: desc, pscCode: psc, flags, pscDict }), [desc, psc, flags, pscDict]);
+
+  const pscInfo = useMemo(() => {
+    const code = (psc || "").replace(/\D/g, "");
+    return pscDict && code ? pscDict[code] : undefined;
+  }, [psc, pscDict]);
+
+  function handleImport(): void {
+    try {
+      const data = JSON.parse(importText) as PSCDict;
+      const ok = data && typeof data === "object" && Object.keys(data).every((k) => typeof (data as any)[k]?.title === "string");
+      if (!ok) throw new Error("Malformed");
+      setPscDict(data);
+      setShowImport(false);
+      setImportText("");
+    } catch (e) {
+      alert("Import failed. Paste valid JSON like { \"8465\": { title: \"...\", includes:[...], excludes:[...] }, ... }");
+    }
+  }
+
+  function exportPSC(): void {
+    const blob = new Blob([JSON.stringify(pscDict, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "psc_dictionary_full.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const [tests, setTests] = useState<TestResult[]>([]);
+  function handleRunTests(): void {
+    setTests(runBuiltinTests());
+  }
+
+  const tone =
+    res.decision.startsWith("Evet") ? "text-emerald-700" : res.decision.startsWith("Hayır") ? "text-slate-700" : "text-amber-700";
+
+  return (
+    <div className="min-h-screen bg-white text-neutral-900">
+      <NXHeader />
+
+      {/* Subheader row with actions */}
+      <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
+        <div className="text-sm text-gray-700">Keyword + PSC → Evet / Hayır / Ek Araştırma • With explanation & research wizard</div>
+        <div className="flex gap-2">
+          <button className="rounded-xl border px-3 py-2" onClick={() => setShowImport(true)}>
+            Import PSC
+          </button>
+          <button className="rounded-xl border px-3 py-2" onClick={exportPSC}>
+            Export PSC
+          </button>
+          <button className="rounded-xl border px-3 py-2" onClick={handleRunTests}>
+            Run Tests
+          </button>
+        </div>
+      </div>
+
+      {/* Main layout */}
+      <main className="mx-auto max-w-6xl space-y-4 px-4 pb-10">
+        <section className="grid gap-4 md:grid-cols-3">
+          {/* Inputs & Clarifiers */}
+          <div className="md:col-span-2 space-y-3">
+            <label className="block">
+              <span className="text-sm font-medium">Product description</span>
+              <textarea
+                className="mt-1 w-full rounded-md border border-neutral-300 p-2 text-sm"
+                rows={4}
+                placeholder="e.g., Long-coverage elbow pad for harsh use, comfortable and durable."
+                value={desc}
+                onChange={(e) => setDesc(e.target.value)}
+              />
+            </label>
+
+            <label className="block">
+              <span className="text-sm font-medium">PSC code (optional)</span>
+              <input
+                className="mt-1 w-full rounded-md border border-neutral-300 p-2 text-sm"
+                placeholder="e.g., 8465"
+                value={psc}
+                onChange={(e) => setPsc(e.target.value)}
+              />
+              {pscInfo && (
+                <div className="mt-2 rounded-md border border-neutral-200 bg-neutral-50 p-2 text-xs text-neutral-700">
+                  <div className="font-semibold">
+                    {psc.replace(/\D/g, "")} — {pscInfo.title}
+                  </div>
+                  {pscInfo.includes?.length ? <div><b>Includes:</b> {pscInfo.includes.join(", ")}</div> : null}
+                  {pscInfo.excludes?.length ? <div><b>Excludes:</b> {pscInfo.excludes.join(", ")}</div> : null}
+                </div>
+              )}
+            </label>
+
+            {/* Clarifiers with one-sentence explanations (always visible) */}
+            <fieldset className="rounded-md border border-neutral-200 p-3">
+              <legend className="px-1 text-sm font-semibold text-neutral-700">Clarifiers</legend>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {FLAG_META.map((m) => (
+                  <label key={m.key} className="flex items-start gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-4 w-4"
+                      checked={flags[m.key]}
+                      onChange={(e) => setFlags({ ...flags, [m.key]: e.target.checked })}
+                    />
+                    <span>
+                      <div className="font-medium text-neutral-900">{m.label}</div>
+                      <div className="text-[11px] leading-snug text-neutral-600">{m.help}</div>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          </div>
+
+          {/* Decision & Explanation */}
+          <aside className="space-y-3">
+            <div className="rounded-md border p-3">
+              <div className="text-sm font-semibold">Decision</div>
+              <div className={`mt-2 inline-block rounded px-2 py-1 text-xs ${tone}`}>{res.decision}</div>
+            </div>
+
+            <div className="rounded-md border border-neutral-200 bg-neutral-50 p-3">
+              <div className="text-sm font-semibold text-neutral-800">Why this result? (signals & context)</div>
+              <ul className="mt-2 list-disc pl-5 text-xs text-neutral-700">
+                {res.explanation.length ? res.explanation.map((e, i) => <li key={i}>{e}</li>) : <li>No specific signals were triggered.</li>}
+              </ul>
+            </div>
+
+            {res.decision === "Ek araştırma gerekli" && (
+              <div className="pt-2">
+                <details className="rounded-xl border p-3">
+                  <summary className="cursor-pointer font-medium">Belirsizliği Azalt (Research Wizard)</summary>
+                  <div className="mt-3 grid gap-3">
+                    <div className="text-sm text-gray-600">Aşağıdaki bilgileri işaretle ve sonucu yeniden değerlendir:</div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
+                      {FLAG_META.map((m) => (
+                        <label key={m.key} className="flex items-start gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            className="mt-1 h-4 w-4"
+                            checked={flags[m.key]}
+                            onChange={(e) => setFlags({ ...flags, [m.key]: e.target.checked })}
+                          />
+                          <span>
+                            <div className="font-medium text-neutral-900">{m.label}</div>
+                            <div className="text-[11px] leading-snug text-neutral-600">{m.help}</div>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    <div className="text-xs text-gray-600">Not: En az iki güçlü sinyal (ör. balistik + NIJ) sonucu "Evet" yönünde güçlendirir.</div>
+                  </div>
+                </details>
+              </div>
+            )}
+          </aside>
+        </section>
+
+        {/* Tests Table */}
+        <section className="rounded-2xl border p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="font-medium">Built-in Tests</div>
+            <button className="rounded-xl border px-3 py-2" onClick={handleRunTests}>
+              Run Tests
+            </button>
+          </div>
+          {!tests.length ? (
+            <div className="text-xs text-gray-500">No tests run yet.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b text-left">
+                    <th className="py-1 pr-2">Case</th>
+                    <th className="py-1 pr-2">Expect</th>
+                    <th className="py-1 pr-2">Got</th>
+                    <th className="py-1 pr-2">Result</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tests.map((t, i) => (
+                    <tr key={i} className="border-b">
+                      <td className="py-1 pr-2">{t.name}</td>
+                      <td className="py-1 pr-2">{t.expect}</td>
+                      <td className="py-1 pr-2">{t.got}</td>
+                      <td className={`py-1 pr-2 ${t.pass ? "text-emerald-700" : "text-rose-700"}`}>{t.pass ? "PASS" : "FAIL"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </main>
+
+      {/* Import Modal */}
+      {showImport && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/30 p-4">
+          <div className="w-full max-w-3xl space-y-3 rounded-2xl bg-white p-5 shadow-xl">
+            <div className="text-lg font-semibold">Import PSC Dictionary</div>
+            <div className="text-xs text-gray-600">
+              Paste JSON for all PSC codes (converted from the PSC Manual). Data is stored locally (this browser).
+            </div>
+            <textarea
+              className="min-h-[220px] w-full rounded-xl border p-3 font-mono text-xs"
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              placeholder='{"0001":{"title":"...","includes":["..."],"excludes":["..."]}, ...}'
+            />
+            <div className="flex justify-end gap-2 pt-2">
+              <button className="rounded-xl border px-4 py-2" onClick={() => setShowImport(false)}>
+                Cancel
+              </button>
+              <button className="rounded-xl bg-black px-4 py-2 text-white" onClick={handleImport}>
+                Import
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer className="px-4 py-6 text-center text-xs text-gray-500">
+        {APP_TITLE} • Heuristic triage only — validate with 22 CFR Part 121 (USML) & EAR • © {new Date().getFullYear()}
+      </footer>
+    </div>
+  );
+}
+
